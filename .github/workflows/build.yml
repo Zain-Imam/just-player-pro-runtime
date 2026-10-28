@@ -30,8 +30,7 @@ jobs:
           curl -fsSLO https://www.python.org/ftp/python/${{ inputs.python }}/$name.sigstore
       - name: Check the signature
         run: |
-          pip install --quiet sigstore
-          python -m sigstore verify identity \
+          pipx run sigstore verify identity \
             --bundle python-${{ inputs.python }}-${{ matrix.host }}.tar.gz.sigstore \
             --cert-identity hugo@python.org --cert-oidc-issuer https://github.com/login/oauth \
             python-${{ inputs.python }}-${{ matrix.host }}.tar.gz
@@ -61,7 +60,11 @@ jobs:
           path: cpython
       - name: Build
         working-directory: cpython
-        run: python3 Android/android.py build ${{ matrix.host }}
+        run: |
+          python3 Android/android.py configure-build
+          python3 Android/android.py make-build
+          python3 Android/android.py configure-host ${{ matrix.host }}
+          python3 Android/android.py make-host ${{ matrix.host }}
       - name: Package
         working-directory: cpython
         run: python3 Android/android.py package ${{ matrix.host }}
