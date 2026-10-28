@@ -1,0 +1,128 @@
+name: Build Python packs
+
+on:
+  workflow_dispatch:
+    inputs:
+      python:
+        description: Python version
+        default: 3.14.9
+      quickjs:
+        description: QuickJS-ng version
+        default: 0.17.0
+
+permissions:
+  contents: write
+
+jobs:
+  # 64-bit: the builds python.org publishes, checked against their signatures
+  official:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { abi: arm64-v8a, host: aarch64-linux-android }
+          - { abi: x86_64, host: x86_64-linux-android }
+    steps:
+      - name: Download from python.org
+        run: |
+          name=python-${{ inputs.python }}-${{ matrix.host }}.tar.gz
+          curl -fsSLO https://www.python.org/ftp/python/${{ inputs.python }}/$name
+          curl -fsSLO https://www.python.org/ftp/python/${{ inputs.python }}/$name.sigstore
+      - name: Check the signature
+        run: |
+          pip install --quiet sigstore
+          python -m sigstore verify identity \
+            --bundle python-${{ inputs.python }}-${{ matrix.host }}.tar.gz.sigstore \
+            --cert-identity hugo@python.org --cert-oidc-issuer https://github.com/login/oauth \
+            python-${{ inputs.python }}-${{ matrix.host }}.tar.gz
+      - name: Unpack
+        run: |
+          mkdir out
+          tar xzf python-${{ inputs.python }}-${{ matrix.host }}.tar.gz -C out ./prefix/lib
+          mv out/prefix/lib lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-${{ matrix.abi }}
+          path: lib
+
+  # 32-bit: python.org publishes none, so built here from the same release with its own Android script
+  built:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { abi: armeabi-v7a, host: arm-linux-androideabi }
+          - { abi: x86, host: i686-linux-android }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: python/cpython
+          ref: v${{ inputs.python }}
+          path: cpython
+      - name: Build
+        working-directory: cpython
+        run: python3 Android/android.py build ${{ matrix.host }}
+      - name: Package
+        working-directory: cpython
+        run: python3 Android/android.py package ${{ matrix.host }}
+      - name: Unpack
+        run: |
+          mkdir out
+          tar xzf cpython/cross-build/${{ matrix.host }}/dist/python-*.tar.gz -C out ./prefix/lib
+          mv out/prefix/lib lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-${{ matrix.abi }}
+          path: lib
+
+  # yt-dlp may need a JavaScript engine for YouTube; the app loads this as a library
+  quickjs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build QuickJS-ng
+        run: |
+          curl -fsSL https://github.com/quickjs-ng/quickjs/archive/refs/tags/v${{ inputs.quickjs }}.tar.gz | tar xz
+          cd quickjs-${{ inputs.quickjs }}
+          bin=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+          for pair in arm64-v8a:aarch64-linux-android armeabi-v7a:armv7a-linux-androideabi \
+                      x86:i686-linux-android x86_64:x86_64-linux-android; do
+            abi=${pair%%:*}; triple=${pair#*:}
+            mkdir -p ../quickjs/$abi
+            $bin/clang --target=${triple}25 -O2 -s -shared -fPIC -D_GNU_SOURCE -DQJS_BUILD_LIBC -Dmain=qjs_main \
+              -o ../quickjs/$abi/libquickjs.so \
+              dtoa.c libregexp.c libunicode.c quickjs.c quickjs-libc.c gen/repl.c gen/standalone.c qjs.c -lm -ldl
+          done
+          cp LICENSE ../quickjs/LICENSE-quickjs.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quickjs
+          path: quickjs
+
+  pack:
+    needs: [official, built, quickjs]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: One zip per ABI, without what yt-dlp never uses
+        run: |
+          v=${{ inputs.python }}; short=${v%.*}
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            lib=python-$abi
+            rm -rf $lib/python$short/{test,idlelib,ensurepip,tkinter,turtledemo,pydoc_data,__phello__} \
+                   $lib/python$short/config-$short-* $lib/python$short/lib-dynload/{_test,xx,_ctypes_test}* \
+                   $lib/libcrypto.so $lib/libssl.so $lib/libsqlite3.so $lib/libsqlite3.so.0 $lib/libpython3.so \
+                   $lib/engines-3 $lib/ossl-modules $lib/pkgconfig
+            test -f $lib/libpython$short.so
+            cp quickjs/$abi/libquickjs.so quickjs/LICENSE-quickjs.txt $lib/
+            mkdir -p zip/lib && rm -rf zip/lib/* && cp -r $lib/. zip/lib/
+            (cd zip && zip -qr9 ../python-$v-$abi.zip lib)
+          done
+          sha256sum python-*.zip | tee SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create python-${{ inputs.python }} python-*.zip SHA256SUMS \
+            --repo ${{ github.repository }} \
+            --title "Python ${{ inputs.python }} for Just Player Pro" \
+            --notes "Built by run ${{ github.run_id }}: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
